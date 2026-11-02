@@ -1,0 +1,660 @@
+// ============================================================
+// PANCAKE POS → GOOGLE SHEETS SYNC
+// v7 — fix trùng đơn (duplicate order_id):
+//      + LockService chống 2 lần sync chạy chồng nhau
+//      + dedupe trong cùng 1 lần fetch (seenInThisRun)
+//      + thêm hàm dọn đơn trùng đã tồn tại (dedupeOrdersSheet)
+// ============================================================
+
+const CONFIG_SHEET  = '⚙️ Config';
+const ORDERS_SHEET  = '📦 Orders';
+const LOG_SHEET     = '📋 Sync Log';
+const TRIGGER_FNAME = 'autoSyncOrders';
+
+const CFG = {
+  API_KEY   : 2,
+  SHOP_ID   : 3,
+  LAST_SYNC : 4,
+  AUTO_INTV : 5,
+  STATUS    : 6,
+};
+
+const ORDER_HEADERS = [
+  // ── Identity ──────────────────────────────────────────────
+  'order_id',             // A  o.id
+  'created_at',           // B  o.inserted_at
+  'updated_at',           // C  o.updated_at
+  // ── Customer ──────────────────────────────────────────────
+  'customer_name',        // D  o.bill_full_name
+  'phone',                // E  o.bill_phone_number (normalized)
+  'customer_id',          // F  o.customer.customer_id
+  'customer_fb_id',       // G  o.customer.fb_id
+  'customer_gender',      // H  o.customer.gender
+  'order_count',          // I  o.customer.order_count
+  'succeed_order_count',  // J  o.customer.succeed_order_count
+  'returned_order_count', // K  o.customer.returned_order_count
+  'purchased_amount',     // L  o.customer.purchased_amount
+  'conversation_link',    // M  o.customer.conversation_link
+  // ── Shipping address ──────────────────────────────────────
+  'shipping_full_name',   // N  o.shipping_address.full_name
+  'shipping_phone',       // O  o.shipping_address.phone_number
+  'shipping_address',     // P  o.shipping_address.full_address
+  // ── Status ────────────────────────────────────────────────
+  'status',               // Q  o.status_name
+  'sub_status',           // R  o.sub_status
+  'shipping_status',      // S  o.partner.partner_status
+  'shipping_code',        // T  o.partner.extend_code
+  'shipping_partner',     // U  o.partner.partner_name
+  'time_send_partner',    // V  o.time_send_partner
+  'picked_up_at',         // W  o.partner.picked_up_at
+  'first_delivery_at',    // X  o.partner.first_delivery_at
+  'estimate_delivery',    // Y  o.estimate_delivery_date
+  'tracking_link',        // Z  o.tracking_link
+  // ── Financials ────────────────────────────────────────────
+  'order_currency',       // AA o.order_currency
+  'total_price',          // AB o.total_price (giá gốc)
+  'total_discount',       // AC o.total_discount
+  'total_after_discount', // AD o.total_price_after_sub_discount
+  'cod',                  // AE o.cod
+  'money_to_collect',     // AF o.money_to_collect
+  'shipping_fee',         // AG o.shipping_fee
+  'partner_fee',          // AH o.partner_fee
+  'tax',                  // AI o.tax
+  'surcharge',            // AJ o.surcharge
+  'cash',                 // AK o.cash
+  'transfer_money',       // AL o.transfer_money
+  'prepaid',              // AM o.prepaid
+  'is_free_shipping',     // AN o.is_free_shipping
+  'customer_pay_fee',     // AO o.customer_pay_fee
+  // ── Products ──────────────────────────────────────────────
+  'total_qty',            // AP o.total_quantity
+  'items_summary',        // AQ tên + qty + giá (human readable)
+  'items_detail',         // AR JSON đầy đủ để join/phân tích
+  'combo_name',           // AS tên combo nếu có
+  'combo_discount',       // AT giảm giá từ combo
+  // ── Source & Tracking ─────────────────────────────────────
+  'ads_source',           // AU o.ads_source
+  'order_source',         // AV o.order_sources_name
+  'ad_id',                // AW o.ad_id
+  'post_id',              // AX o.post_id
+  'conversation_id',      // AY o.conversation_id
+  'page_id',              // AZ o.page_id
+  'page_name',            // BA o.page.name
+  'p_utm_source',         // BB o.p_utm_source
+  'p_utm_medium',         // BC o.p_utm_medium
+  'p_utm_campaign',       // BD o.p_utm_campaign
+  'p_utm_content',        // BE o.p_utm_content
+  'p_utm_term',           // BF o.p_utm_term
+  // ── Staff ─────────────────────────────────────────────────
+  'seller_id',            // BG o.assigning_seller.id
+  'seller_name',          // BH o.assigning_seller.name
+  'last_editor_name',     // BI o.last_editor.name
+  'time_assign_seller',   // BJ o.time_assign_seller
+  // ── Warehouse ─────────────────────────────────────────────
+  'warehouse_name',       // BK o.warehouse_info.name
+  'warehouse_address',    // BL o.warehouse_info.full_address
+  // ── Misc ──────────────────────────────────────────────────
+  'note',                 // BM o.note
+  'is_livestream',        // BN o.is_livestream
+  'is_exchange_order',    // BO o.is_exchange_order
+  'duplicated_phone',     // BP o.duplicated_phone
+  'returned_reason',      // BQ o.returned_reason_name
+  'order_link',           // BR o.order_link
+  // ── AppSheet ──────────────────────────────────────────────
+  'appsheet_order_id',    // BS generated ID (ORDER-ddMMyyyy-HHmmss-XXX)
+];
+
+// ─── MENU ─────────────────────────────────────────────────────
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('🔄 POS Sync')
+    .addItem('▶ Sync ngay', 'manualSync')
+    .addSeparator()
+    .addSubMenu(
+      SpreadsheetApp.getUi().createMenu('⏱ Tự động sync')
+        .addItem('Mỗi 5 phút',    'setAuto5')
+        .addItem('Mỗi 15 phút',   'setAuto15')
+        .addItem('Mỗi 30 phút',   'setAuto30')
+        .addItem('Mỗi 1 giờ',     'setAuto60')
+        .addItem('❌ Tắt tự động', 'disableAuto')
+    )
+    .addSeparator()
+    .addItem('📋 Xem Sync Log', 'openLog')
+    .addItem('🧹 Dọn đơn trùng', 'dedupeOrdersSheet')
+    .addItem('↕️ Sắp xếp theo ngày tạo', 'sortOrdersByCreatedAt')   // ★ thêm dòng này
+    .addItem('🗑 Xóa dữ liệu & reset', 'resetAll')
+    .addToUi();
+}
+
+// ─── MENU ACTIONS ─────────────────────────────────────────────
+function manualSync()  { syncOrders(false); }
+function setAuto5()    { setAutoSync(5);  }
+function setAuto15()   { setAutoSync(15); }
+function setAuto30()   { setAutoSync(30); }
+function setAuto60()   { setAutoSync(60); }
+function disableAuto() { setAutoSync(0);  }
+
+function openLog() {
+  const url = SpreadsheetApp.getActiveSpreadsheet().getUrl() + '#gid=' +
+    getOrCreateSheet(LOG_SHEET).getSheetId();
+  SpreadsheetApp.getUi().showModelessDialog(
+    HtmlService.createHtmlOutput(
+      `<script>window.open('${url}');google.script.host.close();</script>`
+    ), 'Mở log...'
+  );
+}
+
+// ─── AUTO SYNC SETUP ──────────────────────────────────────────
+function setAutoSync(minutes) {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === TRIGGER_FNAME) ScriptApp.deleteTrigger(t);
+  });
+
+  const cfg = getConfigSheet();
+  if (minutes === 0) {
+    cfg.getRange(CFG.AUTO_INTV, 2).setValue('Tắt');
+    cfg.getRange(CFG.STATUS,    2).setValue('⏹ Tự động sync đã tắt');
+    SpreadsheetApp.getUi().alert('Đã tắt tự động sync.');
+    return;
+  }
+
+  ScriptApp.newTrigger(TRIGGER_FNAME).timeBased().everyMinutes(minutes).create();
+  cfg.getRange(CFG.AUTO_INTV, 2).setValue(minutes + ' phút');
+  cfg.getRange(CFG.STATUS,    2).setValue(`✅ Tự động sync mỗi ${minutes} phút`);
+  SpreadsheetApp.getUi().alert(`✅ Đã bật tự động sync mỗi ${minutes} phút.`);
+}
+
+function autoSyncOrders() { syncOrders(true); }
+
+// ─── CORE SYNC ────────────────────────────────────────────────
+function syncOrders(isAuto) {
+  // ★ Chặn 2 lần sync chạy chồng nhau (nguyên nhân chính gây trùng đơn)
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    writeLog('SKIPPED', 0, isAuto ? 'Auto' : 'Manual', 'Lock busy - đang có run khác');
+    return;
+  }
+
+  try {
+    const cfg      = getConfigSheet();
+    const apiKey   = cfg.getRange(CFG.API_KEY,   2).getValue().toString().trim();
+    const shopId   = cfg.getRange(CFG.SHOP_ID,   2).getValue().toString().trim();
+    const lastSync = cfg.getRange(CFG.LAST_SYNC, 2).getValue();
+
+    if (!apiKey || !shopId) {
+      SpreadsheetApp.getUi().alert('⚠️ Chưa điền API Key hoặc Shop ID trong sheet ⚙️ Config.');
+      return;
+    }
+
+    const now      = new Date();
+    const fromDate = lastSync
+      ? Utilities.formatDate(new Date(lastSync), 'UTC', "yyyy-MM-dd'T'HH:mm:ss")
+      : '2024-01-01T00:00:00';
+
+    cfg.getRange(CFG.STATUS, 2).setValue('🔄 Đang sync...');
+    SpreadsheetApp.flush();
+
+    const ordersSheet = getOrCreateSheet(ORDERS_SHEET);
+    ensureOrdersHeader(ordersSheet);
+    const existingIds = buildExistingIdMap(ordersSheet);  // order_id → sheet row number
+    const seenInThisRun = new Set();                      // ★ chặn trùng ngay trong 1 lần fetch
+
+    let page = 1, totalFetched = 0;
+    const newRows = [];     // đơn hoàn toàn mới → append xuống dưới
+    const updateRows = [];  // đơn đã có → ghi đè tại chỗ (row number, data)
+
+    try {
+      while (true) {
+        const url =
+          `https://pos.pages.fm/api/v1/shops/${shopId}/orders` +
+          `?api_key=${encodeURIComponent(apiKey)}` +
+          `&from_date=${fromDate}` +
+          `&page=${page}&page_size=60`;
+
+        const res  = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+        const json = JSON.parse(res.getContentText());
+
+        if (!json.success) throw new Error(JSON.stringify(json));
+        const batch = json.data || [];
+        if (batch.length === 0) break;
+
+        batch.forEach(o => {
+          const row     = orderToRow(o);
+          const orderId = row[0];
+          if (existingIds[orderId] !== undefined) {
+            // Đơn đã tồn tại: ghi đè nhưng GIỮ NGUYÊN appsheet_order_id ở cột BS
+            updateRows.push({ sheetRow: existingIds[orderId], data: row });
+          } else if (!seenInThisRun.has(orderId)) {   // ★ chỉ push nếu chưa gặp trong run này
+            newRows.push(row);
+            seenInThisRun.add(orderId);
+          }
+          totalFetched++;
+        });
+
+        if (batch.length < 60) break;
+        page++;
+        Utilities.sleep(300);
+      }
+
+      // ── 1. Ghi đè đơn đã tồn tại ─────────────────────────────
+      // Chỉ ghi ORDER_HEADERS.length - 1 cột → bảo toàn appsheet_order_id (BS)
+      updateRows.forEach(({ sheetRow, data }) => {
+        ordersSheet.getRange(sheetRow, 1, 1, ORDER_HEADERS.length - 1)
+          .setValues([data.slice(0, ORDER_HEADERS.length - 1)]);
+      });
+
+      // ── 2. Append đơn mới xuống cuối ─────────────────────────
+      // Dùng getLastDataRow() scan cột A → không bị lừa bởi ArrayFormula cột BT:BX
+      if (newRows.length > 0) {
+        newRows.sort((a, b) => (a[1] || '').localeCompare(b[1] || ''));
+        const lastRow = getLastDataRow(ordersSheet);
+        ordersSheet.getRange(lastRow + 1, 1, newRows.length, ORDER_HEADERS.length)
+          .setValues(newRows);
+      }
+
+      // ── 3. Xóa định dạng vùng data (giữ sạch, không highlight) ──
+      clearDataFormatting(ordersSheet);
+
+      const statusMsg = `✅ ${isAuto ? 'Auto' : 'Manual'} sync: ${totalFetched} đơn (${newRows.length} mới, ${updateRows.length} cập nhật) — ${formatVN(now)}`;
+      cfg.getRange(CFG.LAST_SYNC, 2).setValue(Utilities.formatDate(now, 'UTC', "yyyy-MM-dd'T'HH:mm:ss"));
+      cfg.getRange(CFG.STATUS,    2).setValue(statusMsg);
+      writeLog('SUCCESS', totalFetched, isAuto ? 'Auto' : 'Manual', `+${newRows.length} mới / ${updateRows.length} updated`);
+      if (!isAuto) SpreadsheetApp.getUi().alert(statusMsg);
+
+    } catch (e) {
+      const errMsg = '❌ Lỗi: ' + e.message;
+      cfg.getRange(CFG.STATUS, 2).setValue(errMsg);
+      writeLog('ERROR', 0, isAuto ? 'Auto' : 'Manual', e.message);
+      if (!isAuto) SpreadsheetApp.getUi().alert(errMsg);
+    }
+
+  } finally {
+    lock.releaseLock();   // ★ luôn nhả lock dù thành công hay lỗi
+  }
+}
+
+// ─── GENERATE APPSHEET ORDER ID ───────────────────────────────
+// Format: ORDER-ddMMyyyy-HHmmss-XXX
+function generateOrderId(createdAt) {
+  if (!createdAt) return '';
+  const parts = createdAt.match(/(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+  if (!parts) return '';
+  const datePart = parts[3] + parts[2] + parts[1]; // ddMMyyyy
+  const timePart = parts[4] + parts[5] + parts[6]; // HHmmss
+  const uid      = Utilities.getUuid().replace(/-/g, '').substring(0, 3).toUpperCase();
+  return 'ORDER-' + datePart + '-' + timePart + '-' + uid;
+}
+
+// ─── ORDER ROW MAPPER ─────────────────────────────────────────
+function orderToRow(o) {
+  const cust      = o.customer         || {};
+  const shipAddr  = o.shipping_address || {};
+  const partner   = o.partner          || {};
+  const seller    = o.assigning_seller || {};
+  const lastEd    = o.last_editor      || {};
+  const page      = o.page             || {};
+  const wh        = o.warehouse_info   || {};
+  const items     = o.items            || [];
+  const combos    = o.activated_combo_products || [];
+
+  const itemsSummary = items.map(i => {
+    const v = i.variation_info || {};
+    return `${v.name || ''}(${v.product_display_id || ''}) x${i.quantity} @${v.retail_price || 0}`;
+  }).join('; ');
+
+  const itemsDetail = JSON.stringify(items.map(i => {
+    const v = i.variation_info || {};
+    return {
+      sku           : v.product_display_id  || '',
+      name          : v.name                || '',
+      barcode       : v.barcode             || '',
+      qty           : i.quantity            || 0,
+      retail_price  : v.retail_price        || 0,
+      total_discount: i.total_discount      || 0,
+      is_bonus      : i.is_bonus_product    || false,
+      note          : i.note               || '',
+    };
+  }));
+
+  const combo         = combos[0] || {};
+  const comboInfo     = combo.combo_product_info || {};
+  const comboName     = comboInfo.name           || '';
+  const comboDiscount = comboInfo.discount_amount || 0;
+
+  const createdAtVN = toVNDate(o.inserted_at);
+
+  return [
+    o.id                                    || '',  // A  order_id
+    createdAtVN,                                    // B  created_at
+    toVNDate(o.updated_at),                         // C  updated_at
+    o.bill_full_name                        || '',  // D  customer_name
+    normalizePhone(o.bill_phone_number      || ''), // E  phone
+    cust.customer_id                        || '',  // F  customer_id
+    cust.fb_id                              || '',  // G  customer_fb_id
+    cust.gender                             || '',  // H  customer_gender
+    cust.order_count                        || 0,   // I  order_count
+    cust.succeed_order_count                || 0,   // J  succeed_order_count
+    cust.returned_order_count               || 0,   // K  returned_order_count
+    cust.purchased_amount                   || 0,   // L  purchased_amount
+    cust.conversation_link                  || '',  // M  conversation_link
+    shipAddr.full_name                      || '',  // N  shipping_full_name
+    normalizePhone(shipAddr.phone_number    || ''), // O  shipping_phone
+    shipAddr.full_address || shipAddr.address || '',// P  shipping_address
+    o.status_name || o.status               || '',  // Q  status
+    o.sub_status                            || '',  // R  sub_status
+    partner.partner_status                  || '',  // S  shipping_status
+    partner.extend_code                     || '',  // T  shipping_code
+    partner.partner_name                    || '',  // U  shipping_partner
+    toVNDate(o.time_send_partner),                  // V  time_send_partner
+    toVNDate(partner.picked_up_at),                 // W  picked_up_at
+    toVNDate(partner.first_delivery_at),            // X  first_delivery_at
+    toVNDate(o.estimate_delivery_date),             // Y  estimate_delivery
+    o.tracking_link                         || '',  // Z  tracking_link
+    o.order_currency                        || '',  // AA order_currency
+    o.total_price                           || 0,   // AB total_price
+    o.total_discount                        || 0,   // AC total_discount
+    o.total_price_after_sub_discount        || 0,   // AD total_after_discount
+    o.cod                                   || 0,   // AE cod
+    o.money_to_collect                      || 0,   // AF money_to_collect
+    o.shipping_fee                          || 0,   // AG shipping_fee
+    o.partner_fee                           || 0,   // AH partner_fee
+    o.tax                                   || 0,   // AI tax
+    o.surcharge                             || 0,   // AJ surcharge
+    o.cash                                  || 0,   // AK cash
+    o.transfer_money                        || 0,   // AL transfer_money
+    o.prepaid                               || 0,   // AM prepaid
+    o.is_free_shipping                      || false, // AN is_free_shipping
+    o.customer_pay_fee                      || false, // AO customer_pay_fee
+    o.total_quantity                        || 0,   // AP total_qty
+    itemsSummary,                                   // AQ items_summary
+    itemsDetail,                                    // AR items_detail
+    comboName,                                      // AS combo_name
+    comboDiscount,                                  // AT combo_discount
+    o.ads_source || o.order_sources_name    || '',  // AU ads_source
+    o.order_sources_name                    || '',  // AV order_source
+    o.ad_id                                 || '',  // AW ad_id
+    o.post_id                               || '',  // AX post_id
+    o.conversation_id                       || '',  // AY conversation_id
+    o.page_id                               || '',  // AZ page_id
+    page.name                               || '',  // BA page_name
+    o.p_utm_source                          || '',  // BB p_utm_source
+    o.p_utm_medium                          || '',  // BC p_utm_medium
+    o.p_utm_campaign                        || '',  // BD p_utm_campaign
+    o.p_utm_content                         || '',  // BE p_utm_content
+    o.p_utm_term                            || '',  // BF p_utm_term
+    seller.id                               || '',  // BG seller_id
+    seller.name                             || '',  // BH seller_name
+    lastEd.name                             || '',  // BI last_editor_name
+    toVNDate(o.time_assign_seller),                 // BJ time_assign_seller
+    wh.name                                 || '',  // BK warehouse_name
+    wh.full_address                         || '',  // BL warehouse_address
+    o.note                                  || '',  // BM note
+    o.is_livestream                         || false, // BN is_livestream
+    o.is_exchange_order                     || false, // BO is_exchange_order
+    o.duplicated_phone                      || false, // BP duplicated_phone
+    o.returned_reason_name                  || '',  // BQ returned_reason
+    o.order_link                            || '',  // BR order_link
+    generateOrderId(createdAtVN),                   // BS appsheet_order_id
+  ];
+}
+
+// ─── HELPERS ──────────────────────────────────────────────────
+
+// Tìm row cuối thực sự có data ở cột A
+// Tránh bị lừa bởi ArrayFormula ở các cột khác (BT:BX...)
+function getLastDataRow(sheet) {
+  const colA = sheet.getRange('A:A').getValues();
+  for (let i = colA.length - 1; i >= 1; i--) {
+    if (colA[i][0] !== '') return i + 1; // i là 0-based index → row = i+1
+  }
+  return 1; // chỉ có header row
+}
+
+function getConfigSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let s = ss.getSheetByName(CONFIG_SHEET);
+  if (!s) {
+    s = ss.insertSheet(CONFIG_SHEET);
+    s.getRange('A1:B6').setValues([
+      ['Cấu hình',      ''],
+      ['API Key',       ''],
+      ['Shop ID',       ''],
+      ['Last Sync',     ''],
+      ['Auto Interval', 'Tắt'],
+      ['Trạng thái',    '⏹ Chưa sync'],
+    ]);
+    s.getRange('A1:A6').setFontWeight('bold');
+    s.setColumnWidth(1, 150);
+    s.setColumnWidth(2, 300);
+  }
+  return s;
+}
+
+function getOrCreateSheet(name) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  return ss.getSheetByName(name) || ss.insertSheet(name);
+}
+
+function ensureOrdersHeader(sheet) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(ORDER_HEADERS);
+    sheet.setFrozenRows(1);
+  }
+  sheet.getRange(1, 1, 1, ORDER_HEADERS.length)
+    .setFontWeight('bold')
+    .setBackground('#1a73e8')
+    .setFontColor('#ffffff');
+}
+
+function clearDataFormatting(sheet) {
+  const lastRow = getLastDataRow(sheet);
+  if (lastRow < 2) return;
+  const dataRange = sheet.getRange(2, 1, lastRow - 1, ORDER_HEADERS.length);
+  dataRange.setBackground(null);
+  dataRange.setFontColor(null);
+  dataRange.setFontWeight('normal');
+  dataRange.setFontStyle('normal');
+}
+
+function buildExistingIdMap(sheet) {
+  const map = {};
+  const lastRow = getLastDataRow(sheet);
+  if (lastRow < 2) return map;
+  const ids = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  ids.forEach((r, i) => { if (r[0]) map[r[0]] = i + 2; });
+  return map;
+}
+
+function normalizePhone(p) {
+  p = p.toString().replace(/\D/g, '');
+  if (p.startsWith('84')  && p.length === 11) p = '0' + p.slice(2);
+  if (p.startsWith('855') && p.length >= 11)  p = '0' + p.slice(3);
+  return "'" + p;
+}
+
+function toVNDate(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso + 'Z');
+    return Utilities.formatDate(d, 'Asia/Ho_Chi_Minh', 'yyyy-MM-dd HH:mm:ss');
+  } catch(e) { return iso; }
+}
+
+function formatVN(d) {
+  return Utilities.formatDate(d, 'Asia/Ho_Chi_Minh', 'dd/MM/yyyy HH:mm:ss');
+}
+
+function writeLog(status, count, mode, err) {
+  const s = getOrCreateSheet(LOG_SHEET);
+  if (s.getLastRow() === 0) {
+    s.appendRow(['Thời gian', 'Trạng thái', 'Số đơn', 'Mode', 'Lỗi']);
+    s.getRange(1, 1, 1, 5).setFontWeight('bold').setBackground('#f0f0f0');
+  }
+  s.appendRow([formatVN(new Date()), status, count, mode, err]);
+}
+
+// ─── DỌN ĐƠN TRÙNG ────────────────────────────────────────────
+// Chạy 1 lần để dọn sạch các order_id đã bị duplicate trong sheet
+// (do bug ở các lần sync trước khi có LockService)
+function dedupeOrdersSheet() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    SpreadsheetApp.getUi().alert('⏳ Đang có sync/dedupe khác chạy, thử lại sau ít giây.');
+    return;
+  }
+
+  try {
+    const sheet = getOrCreateSheet(ORDERS_SHEET);
+    const lastRow = getLastDataRow(sheet);
+    if (lastRow < 2) return;
+
+    const range = sheet.getRange(2, 1, lastRow - 1, ORDER_HEADERS.length);
+    const data  = range.getValues();
+
+    const seen = {};
+    const bsIdx = ORDER_HEADERS.length - 1;
+
+    data.forEach(row => {
+      const orderId = row[0];
+      if (!orderId) return;
+      if (!(orderId in seen)) {
+        seen[orderId] = row;
+      } else if (!seen[orderId][bsIdx] && row[bsIdx]) {
+        seen[orderId] = row;
+      }
+    });
+
+    const keepRows = Object.keys(seen).map(id => seen[id]);
+
+    keepRows.sort((a, b) => {
+      const av = a[1] instanceof Date ? a[1].getTime() : String(a[1] || '');
+      const bv = b[1] instanceof Date ? b[1].getTime() : String(b[1] || '');
+      return av < bv ? -1 : (av > bv ? 1 : 0);
+    });
+
+    const removedCount = data.length - keepRows.length;
+
+    range.clearContent();
+    if (keepRows.length > 0) {
+      sheet.getRange(2, 1, keepRows.length, ORDER_HEADERS.length).setValues(keepRows);
+    }
+
+    SpreadsheetApp.getUi().alert(`✅ Đã xóa ${removedCount} dòng trùng. Còn lại ${keepRows.length} đơn.`);
+    writeLog('DEDUPE', removedCount, 'Manual', `Removed ${removedCount} duplicate rows`);
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function resetAll() {
+  const ui  = SpreadsheetApp.getUi();
+  const res = ui.alert(
+    '⚠️ Xác nhận xóa',
+    'Sẽ xóa toàn bộ dữ liệu Orders, Log và reset Last Sync. Tiếp tục?',
+    ui.ButtonSet.YES_NO
+  );
+  if (res !== ui.Button.YES) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ['📦 Orders', '📋 Sync Log'].forEach(name => {
+    const s = ss.getSheetByName(name);
+    if (s) s.clearContents();
+  });
+  getConfigSheet().getRange(CFG.LAST_SYNC, 2).clearContent();
+  getConfigSheet().getRange(CFG.STATUS,    2).setValue('⏹ Đã reset');
+  ui.alert('✅ Đã xóa dữ liệu và reset Last Sync.');
+}
+
+// ─── DEBUG ────────────────────────────────────────────────────
+function inspectFullSchema() {
+  const cfg    = getConfigSheet();
+  const apiKey = cfg.getRange(CFG.API_KEY, 2).getValue().toString().trim();
+  const shopId = cfg.getRange(CFG.SHOP_ID, 2).getValue().toString().trim();
+
+  const url =
+    `https://pos.pages.fm/api/v1/shops/${shopId}/orders` +
+    `?api_key=${encodeURIComponent(apiKey)}&page=1&page_size=3`;
+
+  const res  = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  const json = JSON.parse(res.getContentText());
+  const orders = json.data || [];
+
+  function flattenKeys(obj, prefix) {
+    prefix = prefix || '';
+    const result = [];
+    Object.keys(obj || {}).forEach(key => {
+      const fullKey = prefix ? prefix + '.' + key : key;
+      const val = obj[key];
+      if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+        result.push([fullKey, '[object]', '']);
+        flattenKeys(val, fullKey).forEach(r => result.push(r));
+      } else if (Array.isArray(val)) {
+        result.push([fullKey, '[array len=' + val.length + ']', JSON.stringify(val).slice(0, 200)]);
+        if (val.length > 0 && typeof val[0] === 'object') {
+          flattenKeys(val[0], fullKey + '[0]').forEach(r => result.push(r));
+        }
+      } else {
+        result.push([fullKey, typeof val, val === null ? 'NULL' : String(val).slice(0, 200)]);
+      }
+    });
+    return result;
+  }
+
+  const schema = getOrCreateSheet('🔍 Schema');
+  schema.clearContents();
+  schema.appendRow(['Key Path', 'Type', 'Sample Value']);
+  schema.getRange(1, 1, 1, 3).setFontWeight('bold').setBackground('#e8710a').setFontColor('#ffffff');
+
+  if (orders.length > 0) {
+    const rows = flattenKeys(orders[0]);
+    schema.getRange(2, 1, rows.length, 3).setValues(rows);
+    schema.setColumnWidth(1, 350);
+    schema.setColumnWidth(2, 100);
+    schema.setColumnWidth(3, 500);
+    schema.setFrozenRows(1);
+    SpreadsheetApp.getUi().alert(`✅ Tìm thấy ${rows.length} fields. Xem sheet 🔍 Schema.`);
+  }
+}
+
+function debugTimestamp() {
+  const cfg    = getConfigSheet();
+  const apiKey = cfg.getRange(CFG.API_KEY, 2).getValue().toString().trim();
+  const shopId = cfg.getRange(CFG.SHOP_ID, 2).getValue().toString().trim();
+
+  const url = `https://pos.pages.fm/api/v1/shops/${shopId}/orders?api_key=${encodeURIComponent(apiKey)}&page=1&page_size=1`;
+  const res  = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  const json = JSON.parse(res.getContentText());
+  const o    = json.data[0];
+
+  Logger.log('inserted_at raw: ' + o.inserted_at);
+  Logger.log('new Date():      ' + new Date(o.inserted_at));
+  Logger.log('getTime():       ' + new Date(o.inserted_at).getTime());
+}
+
+function sortOrdersByCreatedAt() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    SpreadsheetApp.getUi().alert('⏳ Đang có sync/dedupe khác chạy, thử lại sau.');
+    return;
+  }
+  try {
+    const sheet = getOrCreateSheet(ORDERS_SHEET);
+    const lastRow = getLastDataRow(sheet);
+    if (lastRow < 2) return;
+
+    const range = sheet.getRange(2, 1, lastRow - 1, ORDER_HEADERS.length);
+    const data  = range.getValues();
+
+    data.sort((a, b) => {
+      const av = a[1] instanceof Date ? a[1].getTime() : String(a[1] || '');
+      const bv = b[1] instanceof Date ? b[1].getTime() : String(b[1] || '');
+      return av < bv ? -1 : (av > bv ? 1 : 0);
+    });
+
+    range.setValues(data);
+    SpreadsheetApp.getUi().alert('✅ Đã sắp xếp lại theo created_at.');
+  } finally {
+    lock.releaseLock();
+  }
+}
